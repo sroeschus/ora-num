@@ -1,5 +1,6 @@
 //! Convert an Oracle NUMBER from its internal (base-100) byte representation
-//! into an exact decimal string.
+//! into an exact decimal string, or (with `--reverse`) a decimal number into
+//! its internal representation.
 //!
 //! Encoding summary:
 //! * byte 0 is the sign/exponent byte, the remaining bytes are base-100 digits
@@ -15,9 +16,10 @@ use clap::{Parser, ValueEnum};
 use std::fmt;
 use std::process::ExitCode;
 
+/// Input format, or with `--reverse` the output format.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 enum Format {
-    /// Detect the format from the input
+    /// Detect the format from the input (with --reverse: same as hex)
     Auto,
     /// Decimal byte list, e.g. "194,2,24" (output of DUMP(x))
     Dec,
@@ -26,15 +28,21 @@ enum Format {
     Hex,
 }
 
-/// Convert an Oracle internal NUMBER representation to a decimal number.
+/// Convert an Oracle internal NUMBER representation to a decimal number, or
+/// a decimal number to its internal representation with --reverse.
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Args {
     /// Oracle internal number, e.g. "Typ=2 Len=3: 194,2,24", "194,2,24", "c2,2,18", "C20218"
-    /// or "col 0: [ 3] c2 02 18"
+    /// or "col 0: [ 3] c2 02 18". With --reverse a decimal number, e.g. "-1234.5678" or "1.5e-7"
+    #[arg(allow_hyphen_values = true)]
     input: String,
 
-    /// Input format
+    /// Convert a decimal number into the Oracle internal representation
+    #[arg(short, long)]
+    reverse: bool,
+
+    /// Input format (with --reverse: output format)
     #[arg(short, long, value_enum, default_value_t = Format::Auto)]
     format: Format,
 
@@ -53,6 +61,9 @@ enum Error {
     BadPrefix(String),
     LengthMismatch { declared: usize, actual: usize },
     NullColumn(u32),
+    BadDecimal(String),
+    Overflow,
+    Underflow,
 }
 
 impl fmt::Display for Error {
@@ -75,6 +86,15 @@ impl fmt::Display for Error {
                     "column {col} is NULL in the block dump, there is no number to convert"
                 )
             }
+            Error::BadDecimal(t) => write!(f, "cannot parse '{t}' as a decimal number"),
+            Error::Overflow => write!(
+                f,
+                "number too large, an Oracle NUMBER must be below 1e126 in magnitude"
+            ),
+            Error::Underflow => write!(
+                f,
+                "number too small, the smallest non-zero Oracle NUMBER magnitude is 1e-130"
+            ),
             Error::LengthMismatch { declared, actual } => {
                 write!(
                     f,
@@ -308,33 +328,220 @@ fn to_decimal(d: &Decoded) -> String {
     out
 }
 
+/// Maximum number of base-100 digits in an Oracle NUMBER.
+const MAX_DIGITS: usize = 20;
+/// Range of the base-100 exponent of the first digit.
+const MIN_EXPONENT: i32 = -65;
+const MAX_EXPONENT: i32 = 62;
+
+/// Parse a decimal number such as "-1234.5678", ".5", "1e10" or "~" / "-~"
+/// (infinity). More than 20 base-100 digits are rounded half away from zero,
+/// as Oracle does; the second value is `true` if rounding happened.
+fn parse_decimal(input: &str) -> Result<(Decoded, bool), Error> {
+    let text = input.trim();
+    let bad = || Error::BadDecimal(text.to_string());
+    match text {
+        "~" | "+~" => return Ok((Decoded::PosInfinity, false)),
+        "-~" => return Ok((Decoded::NegInfinity, false)),
+        _ => {}
+    }
+
+    let (negative, unsigned) = match text.as_bytes().first() {
+        Some(b'-') => (true, &text[1..]),
+        Some(b'+') => (false, &text[1..]),
+        _ => (false, text),
+    };
+    let (mantissa, exp10) = match unsigned.find(['e', 'E']) {
+        Some(i) => {
+            let e = &unsigned[i + 1..];
+            // Exponents beyond i32 are far outside the range anyway; keep them
+            // distinguishable from syntax errors by saturating.
+            let valid = e.strip_prefix(['+', '-']).unwrap_or(e);
+            if valid.is_empty() || !valid.bytes().all(|c| c.is_ascii_digit()) {
+                return Err(bad());
+            }
+            let exp = e.parse::<i64>().unwrap_or(if e.starts_with('-') {
+                i64::MIN / 4
+            } else {
+                i64::MAX / 4
+            });
+            (&unsigned[..i], exp)
+        }
+        None => (unsigned, 0),
+    };
+    let (int_part, frac_part) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    if int_part.is_empty() && frac_part.is_empty()
+        || !int_part
+            .bytes()
+            .chain(frac_part.bytes())
+            .all(|c| c.is_ascii_digit())
+    {
+        return Err(bad());
+    }
+
+    // All decimal digits, and the position of the decimal point within them.
+    let all: Vec<u8> = int_part
+        .bytes()
+        .chain(frac_part.bytes())
+        .map(|c| c - b'0')
+        .collect();
+    let mut point = int_part.len() as i64 + exp10;
+    let Some(first) = all.iter().position(|&d| d != 0) else {
+        return Ok((Decoded::Zero, false));
+    };
+    let last = all.iter().rposition(|&d| d != 0).unwrap();
+    point -= first as i64;
+    let mut dec = all[first..=last].to_vec();
+
+    // Align the decimal point to a pair boundary, then group into base-100 digits.
+    if point.rem_euclid(2) == 1 {
+        dec.insert(0, 0);
+        point += 1;
+    }
+    if dec.len() % 2 == 1 {
+        dec.push(0);
+    }
+    let mut digits: Vec<u8> = dec.chunks(2).map(|p| p[0] * 10 + p[1]).collect();
+    let mut exponent = point / 2 - 1;
+
+    let mut rounded = false;
+    if digits.len() > MAX_DIGITS {
+        rounded = true;
+        let round_up = digits[MAX_DIGITS] >= 50;
+        digits.truncate(MAX_DIGITS);
+        if round_up {
+            let mut i = MAX_DIGITS;
+            loop {
+                if i == 0 {
+                    // Carry out of the first digit: 99.99 -> 100.
+                    digits.insert(0, 1);
+                    digits.truncate(MAX_DIGITS);
+                    exponent += 1;
+                    break;
+                }
+                i -= 1;
+                if digits[i] == 99 {
+                    digits[i] = 0;
+                } else {
+                    digits[i] += 1;
+                    break;
+                }
+            }
+        }
+        while digits.last() == Some(&0) {
+            digits.pop();
+        }
+    }
+
+    if exponent > MAX_EXPONENT as i64 {
+        return Err(Error::Overflow);
+    }
+    if exponent < MIN_EXPONENT as i64 {
+        return Err(Error::Underflow);
+    }
+    Ok((
+        Decoded::Finite {
+            negative,
+            exponent: exponent as i32,
+            digits,
+        },
+        rounded,
+    ))
+}
+
+/// Encode a number into the Oracle internal byte representation.
+fn encode(d: &Decoded) -> Vec<u8> {
+    match d {
+        Decoded::Zero => vec![0x80],
+        Decoded::PosInfinity => vec![0xFF, 0x65],
+        Decoded::NegInfinity => vec![0x00],
+        Decoded::Finite {
+            negative: false,
+            exponent,
+            digits,
+        } => std::iter::once((exponent + 193) as u8)
+            .chain(digits.iter().map(|d| d + 1))
+            .collect(),
+        Decoded::Finite {
+            negative: true,
+            exponent,
+            digits,
+        } => {
+            let mut bytes: Vec<u8> = std::iter::once((62 - exponent) as u8)
+                .chain(digits.iter().map(|d| 101 - d))
+                .collect();
+            // Oracle omits the terminator when all 20 digits are used.
+            if digits.len() < MAX_DIGITS {
+                bytes.push(102);
+            }
+            bytes
+        }
+    }
+}
+
+fn hex_string(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02X}")).collect()
+}
+
+fn dec_list(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|b| b.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn print_components(decoded: &Decoded) {
+    if let Decoded::Finite {
+        negative,
+        exponent,
+        digits,
+    } = decoded
+    {
+        println!("sign:     {}", if *negative { "-" } else { "+" });
+        println!("exponent: {exponent} (base 100)");
+        println!("digits:   {digits:?}");
+    }
+}
+
+fn run(args: &Args) -> Result<(), Error> {
+    if args.reverse {
+        let (decoded, rounded) = parse_decimal(&args.input)?;
+        let bytes = encode(&decoded);
+        if rounded {
+            eprintln!(
+                "note: rounded to {} (20 base-100 digits)",
+                to_decimal(&decoded)
+            );
+        }
+        if args.verbose {
+            println!("value:    {}", to_decimal(&decoded));
+            print_components(&decoded);
+            println!("dump:     Typ=2 Len={}: {}", bytes.len(), dec_list(&bytes));
+            print!("bytes:    ");
+        }
+        match args.format {
+            Format::Dec => println!("{}", dec_list(&bytes)),
+            Format::Auto | Format::Hex => println!("{}", hex_string(&bytes)),
+        }
+    } else {
+        let bytes = parse_input(&args.input, args.format)?;
+        let decoded = decode(&bytes)?;
+        if args.verbose {
+            let hex: Vec<String> = bytes.iter().map(|b| format!("{b:02X}")).collect();
+            println!("bytes:    {}", hex.join(" "));
+            print_components(&decoded);
+            print!("value:    ");
+        }
+        println!("{}", to_decimal(&decoded));
+    }
+    Ok(())
+}
+
 fn main() -> ExitCode {
     let args = Args::parse();
-    let result = parse_input(&args.input, args.format).and_then(|bytes| {
-        let decoded = decode(&bytes)?;
-        Ok((bytes, decoded))
-    });
-
-    match result {
-        Ok((bytes, decoded)) => {
-            if args.verbose {
-                let hex: Vec<String> = bytes.iter().map(|b| format!("{b:02X}")).collect();
-                println!("bytes:    {}", hex.join(" "));
-                if let Decoded::Finite {
-                    negative,
-                    exponent,
-                    digits,
-                } = &decoded
-                {
-                    println!("sign:     {}", if *negative { "-" } else { "+" });
-                    println!("exponent: {exponent} (base 100)");
-                    println!("digits:   {digits:?}");
-                }
-                print!("value:    ");
-            }
-            println!("{}", to_decimal(&decoded));
-            ExitCode::SUCCESS
-        }
+    match run(&args) {
+        Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("error: {e}");
             ExitCode::FAILURE
@@ -593,5 +800,202 @@ mod tests {
             conv(&format!("Typ=2 Len=22: {}", dec.join(","))),
             format!("-{}", "9".repeat(40))
         );
+    }
+
+    fn enc(input: &str) -> String {
+        hex_string(&encode(&parse_decimal(input).unwrap().0))
+    }
+
+    #[test]
+    fn reverse_known_values() {
+        for (value, hex) in [
+            ("0", "80"),
+            ("1", "C102"),
+            ("100", "C202"),
+            ("123", "C20218"),
+            ("-123", "3D644E66"),
+            ("0.5", "C033"),
+            ("-0.5", "3F3366"),
+            ("1234.5678", "C20D23394F"),
+            ("-1234.5678", "3D59432D1766"),
+            ("0.0001", "BF02"),
+            ("100000", "C30B"),
+            ("-2", "3E6366"),
+            ("~", "FF65"),
+            ("-~", "00"),
+            ("1e-130", "8002"),
+            ("-1e-130", "7F6466"),
+            ("1e125", "FF0B"),
+            ("-1e125", "005B66"),
+        ] {
+            assert_eq!(enc(value), hex, "{value}");
+        }
+    }
+
+    #[test]
+    fn reverse_syntax() {
+        // Different spellings of the same number.
+        for s in [
+            "123", "+123", " 123 ", "123.", "123.000", "0123", "1.23e2", "1.23E+2", "12300e-2",
+            ".123e3",
+        ] {
+            assert_eq!(enc(s), "C20218", "{s}");
+        }
+        assert_eq!(enc(".5"), "C033");
+        assert_eq!(enc("-.5"), "3F3366");
+        assert_eq!(enc("+~"), "FF65");
+        // All zeros, with any sign or exponent, are zero.
+        for s in [
+            "0",
+            "-0",
+            "+0",
+            "0.000",
+            ".0",
+            "0e999",
+            "-0e-999",
+            "000.000e5",
+        ] {
+            assert_eq!(enc(s), "80", "{s}");
+        }
+        for s in [
+            "", "-", "+", ".", "-.", "e5", "1e", "1e+", "1.2.3", "1,5", "abc", "1_000", "--1",
+            "1e1.5", " 1 2", "0x10", "~1", "inf",
+        ] {
+            assert!(
+                matches!(parse_decimal(s), Err(Error::BadDecimal(_))),
+                "{s:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn reverse_range() {
+        let max = format!("{}{}", "9".repeat(40), "0".repeat(86));
+        assert_eq!(enc(&max), repeat(0xFF, 0x64, 20));
+        assert_eq!(enc(&format!("-{max}")), repeat(0x00, 0x02, 20));
+        assert_eq!(parse_decimal("1e126"), Err(Error::Overflow));
+        assert_eq!(parse_decimal("-1e126"), Err(Error::Overflow));
+        assert_eq!(parse_decimal("1e-131"), Err(Error::Underflow));
+        assert_eq!(parse_decimal("-9.9e-131"), Err(Error::Underflow));
+        // Huge exponents are range errors, not syntax errors.
+        assert_eq!(
+            parse_decimal("1e99999999999999999999999"),
+            Err(Error::Overflow)
+        );
+        assert_eq!(
+            parse_decimal("1e-99999999999999999999999"),
+            Err(Error::Underflow)
+        );
+        // Rounding up to 1e126 overflows.
+        assert_eq!(parse_decimal(&"9".repeat(127)), Err(Error::Overflow));
+    }
+
+    #[test]
+    fn reverse_rounding() {
+        // 40 digits fit exactly, no rounding.
+        let forty = "1234567890".repeat(4);
+        assert!(!parse_decimal(&forty).unwrap().1);
+        // 21st base-100 digit < 50: truncated.
+        let (d, rounded) = parse_decimal(&format!("{forty}49")).unwrap();
+        assert!(rounded);
+        assert_eq!(to_decimal(&d), format!("{forty}00"));
+        // 21st base-100 digit >= 50: rounded up, also for negatives.
+        let (d, _) = parse_decimal(&format!("-{forty}50")).unwrap();
+        assert_eq!(
+            to_decimal(&d),
+            format!("-{}00", "1234567890".repeat(3) + "1234567891")
+        );
+        // Carry through all digits: 44 nines -> 1e44.
+        let (d, rounded) = parse_decimal(&"9".repeat(44)).unwrap();
+        assert!(rounded);
+        assert_eq!(to_decimal(&d), format!("1{}", "0".repeat(44)));
+        assert_eq!(hex_string(&encode(&d)), "D702");
+        // Odd alignment: 43 nines -> 0x09 then 99s -> 1e43.
+        let (d, _) = parse_decimal(&"9".repeat(43)).unwrap();
+        assert_eq!(to_decimal(&d), format!("1{}", "0".repeat(43)));
+        // Rounding in the fraction: 1/3 to 40 digits.
+        let (d, _) = parse_decimal(&format!("0.{}", "3".repeat(50))).unwrap();
+        assert_eq!(to_decimal(&d), format!("0.{}", "3".repeat(40)));
+        let (d, _) = parse_decimal(&format!("0.{}", "6".repeat(50))).unwrap();
+        assert_eq!(to_decimal(&d), format!("0.{}7", "6".repeat(39)));
+    }
+
+    #[test]
+    fn reverse_terminator() {
+        // Negative numbers get a 0x66 terminator unless all 20 digits are used.
+        assert_eq!(
+            enc(&format!("-{}", "9".repeat(38))),
+            format!("{}66", repeat(0x2C, 0x02, 19))
+        );
+        assert_eq!(enc(&format!("-{}", "9".repeat(40))), repeat(0x2B, 0x02, 20));
+    }
+
+    /// bytes -> decimal -> bytes must be the identity for canonical encodings
+    /// (no trailing zero digit), for every exponent byte.
+    #[test]
+    fn round_trip_bytes() {
+        let check = |bytes: Vec<u8>| {
+            let text = to_decimal(&decode(&bytes).unwrap());
+            let (d, rounded) = parse_decimal(&text).unwrap();
+            assert!(!rounded, "{text}");
+            assert_eq!(encode(&d), bytes, "{text}");
+        };
+        for exp in 0x80..=0xFFu8 {
+            for d1 in 2..=100u8 {
+                if exp == 0xFF && d1 == 0x65 {
+                    continue;
+                }
+                check(vec![exp, d1]);
+                for d2 in (2..=100u8).step_by(19) {
+                    check(vec![exp, d1, d2]);
+                    check(vec![exp, d2, 1, d1]);
+                }
+            }
+            check(repeat_bytes(exp, 0x64, 20));
+        }
+        for exp in 0x00..0x80u8 {
+            for d1 in 2..=100u8 {
+                check(vec![exp, d1, 102]);
+                for d2 in (2..=100u8).step_by(19) {
+                    check(vec![exp, d1, d2, 102]);
+                    check(vec![exp, d2, 101, d1, 102]);
+                }
+            }
+            check(repeat_bytes(exp, 0x02, 20));
+        }
+        check(vec![0x80]);
+        check(vec![0xFF, 0x65]);
+        check(vec![0x00]);
+    }
+
+    fn repeat_bytes(first: u8, digit: u8, n: usize) -> Vec<u8> {
+        std::iter::once(first)
+            .chain(std::iter::repeat_n(digit, n))
+            .collect()
+    }
+
+    /// decimal -> bytes -> decimal must give back the normalized number.
+    #[test]
+    fn round_trip_decimal() {
+        for s in [
+            "1",
+            "-1",
+            "10",
+            "99",
+            "101",
+            "0.1",
+            "0.01",
+            "0.001",
+            "-0.000123",
+            "3.14159265358979323846264338327950288419",
+            "-2.718281828459045",
+            "1000000000000000000000000000000",
+            "0.00000000000000000000000000001",
+            "12345678901234567890123456789012345678.9",
+            "-0.1234567890123456789012345678901234567891",
+        ] {
+            let bytes = encode(&parse_decimal(s).unwrap().0);
+            assert_eq!(to_decimal(&decode(&bytes).unwrap()), s, "{s}");
+        }
     }
 }

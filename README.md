@@ -1,7 +1,8 @@
 # ora-num
 
 Convert an Oracle `NUMBER` from its internal byte representation (as shown by
-`DUMP()`, `DUMP(x, 16)` or `RAWTOHEX()`) into an exact decimal string.
+`DUMP()`, `DUMP(x, 16)`, `RAWTOHEX()` or a block dump) into an exact decimal
+string, and with `--reverse` a decimal number into its internal representation.
 
 ## Building
 
@@ -17,12 +18,16 @@ The binary is written to `target/release/ora-num`.
 ora-num [OPTIONS] <INPUT>
 ```
 
-| Option                 | Description                                         |
-|------------------------|-----------------------------------------------------|
-| `-f, --format <FORMAT>` | Input format: `auto` (default), `dec` or `hex`      |
-| `-v, --verbose`        | Also print the bytes, sign, exponent and digits     |
-| `-h, --help`           | Show help                                           |
-| `-V, --version`        | Show version                                        |
+| Option                  | Description                                                    |
+|-------------------------|----------------------------------------------------------------|
+| `-r, --reverse`         | Convert a decimal number into the internal representation     |
+| `-f, --format <FORMAT>` | Input format (output format with `-r`): `auto` (default), `dec` or `hex` |
+| `-v, --verbose`         | Also print the bytes, sign, exponent and digits                |
+| `-h, --help`            | Show help                                                      |
+| `-V, --version`         | Show version                                                   |
+
+Without `-r`, the input is an Oracle internal number and the output is the
+decimal value. This is the default mode.
 
 ### Accepted input
 
@@ -153,6 +158,61 @@ value:    123
 
 Infinity is printed the way Oracle displays it: `~` for +infinity (`FF 65`)
 and `-~` for -infinity (`00`).
+
+## Reverse conversion
+
+With `-r`, the input is a decimal number and the output is the internal
+representation, as contiguous hex by default (usable with `HEXTORAW()` or as
+input to `ora-num` again) or as a decimal byte list with `-f dec`:
+
+```sh
+$ ora-num -r 123
+C20218
+
+$ ora-num -r -f dec -1234.5678
+61,89,67,45,23,102
+
+$ ora-num -r 1.5e-7
+BD10
+```
+
+Accepted input: an optional sign, digits with an optional decimal point
+(`.5` and `5.` are fine), an optional exponent (`1.5e-7`, `1E+3`), and `~` /
+`-~` for infinity. Quote `"~"` so the shell does not expand it. Negative
+numbers can be given directly, without `--`.
+
+With `-v`, the components and the `DUMP()` form are printed as well:
+
+```sh
+$ ora-num -r -v -1234.5678
+value:    -1234.5678
+sign:     -
+exponent: 1 (base 100)
+digits:   [12, 34, 56, 78]
+dump:     Typ=2 Len=6: 61,89,67,45,23,102
+bytes:    3D59432D1766
+```
+
+An Oracle `NUMBER` holds at most 20 base-100 digits (up to 40 significant
+decimal digits). Longer input is rounded half away from zero, like Oracle
+does, and a note is printed to stderr:
+
+```sh
+$ ora-num -r 0.66666666666666666666666666666666666666666666
+note: rounded to 0.6666666666666666666666666666666666666667 (20 base-100 digits)
+C04343434343434343434343434343434343434344
+```
+
+Numbers of magnitude 1e126 or more, and non-zero numbers below 1e-130, are
+rejected:
+
+```sh
+$ ora-num -r 1e126
+error: number too large, an Oracle NUMBER must be below 1e126 in magnitude
+```
+
+Oracle itself raises an overflow error for the first case but silently stores
+zero for the second; `ora-num` reports both as errors.
 
 ## Encoding
 
