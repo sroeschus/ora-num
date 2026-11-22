@@ -12,6 +12,21 @@ cargo build --release
 
 The binary is written to `target/release/ora-num`.
 
+## Man page
+
+A man page is in `man/ora-num.1`. View it without installing:
+
+```sh
+man -l man/ora-num.1
+```
+
+Install it together with the binary:
+
+```sh
+install -Dm755 target/release/ora-num /usr/local/bin/ora-num
+install -Dm644 man/ora-num.1 /usr/local/share/man/man1/ora-num.1
+```
+
 ## Usage
 
 ```
