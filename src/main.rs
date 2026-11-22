@@ -5,10 +5,11 @@
 //! * byte 0 is the sign/exponent byte, the remaining bytes are base-100 digits
 //!   (most significant first).
 //! * `0x80` alone is zero.
-//! * positive: exponent byte > 0x80, exponent = byte - 193, digit = byte - 1
+//! * positive: exponent byte >= 0x80, exponent = byte - 193, digit = byte - 1
+//!   (`0x80 0x02` is 1e-130, the smallest positive value)
 //! * negative: exponent byte < 0x80, exponent = 62 - byte, digit = 101 - byte,
 //!   optionally terminated by a 102 (0x66) byte.
-//! * `0xFF 0x65` is +infinity, `0x00` is -infinity.
+//! * `0xFF 0x65` is +infinity, `0x00` alone is -infinity.
 
 use clap::{Parser, ValueEnum};
 use std::fmt;
@@ -215,7 +216,9 @@ fn decode(bytes: &[u8]) -> Result<Decoded, Error> {
         _ => {}
     }
 
-    let (negative, exponent, digits) = if first > 0x80 {
+    // 0x80 and 0x00 followed by digits are the smallest/largest exponents
+    // (-65 and 62), not zero or -infinity.
+    let (negative, exponent, digits) = if first >= 0x80 {
         let digits = rest
             .iter()
             .enumerate()
@@ -228,7 +231,7 @@ fn decode(bytes: &[u8]) -> Result<Decoded, Error> {
             })
             .collect::<Result<Vec<_>, _>>()?;
         (false, first as i32 - 193, digits)
-    } else if (0x01..0x80).contains(&first) {
+    } else {
         let rest = rest.strip_suffix(&[102]).unwrap_or(rest);
         let digits = rest
             .iter()
@@ -242,8 +245,6 @@ fn decode(bytes: &[u8]) -> Result<Decoded, Error> {
             })
             .collect::<Result<Vec<_>, _>>()?;
         (true, 62 - first as i32, digits)
-    } else {
-        return Err(Error::BadExponent(first));
     };
 
     if digits.is_empty() {
@@ -438,6 +439,159 @@ mod tests {
             decode(&[0xC2, 0x00]),
             Err(Error::BadDigit { pos: 1, byte: 0 })
         );
-        assert_eq!(decode(&[0x80, 0x02]), Err(Error::BadExponent(0x80)));
+        // Exponent byte without any digits.
+        assert_eq!(decode(&[0xC1]), Err(Error::BadExponent(0xC1)));
+        assert_eq!(decode(&[0x3E, 0x66]), Err(Error::BadExponent(0x3E)));
+    }
+
+    /// Hex string of an exponent byte followed by `n` copies of a digit byte.
+    fn repeat(first: u8, digit: u8, n: usize) -> String {
+        std::iter::once(first)
+            .chain(std::iter::repeat_n(digit, n))
+            .map(|b| format!("{b:02X}"))
+            .collect()
+    }
+
+    #[test]
+    fn range_limits() {
+        // Smallest magnitudes: 1e-130 uses exponent byte 0x80 / 0x7F.
+        assert_eq!(conv("8002"), format!("0.{}1", "0".repeat(129)));
+        assert_eq!(conv("7F6466"), format!("-0.{}1", "0".repeat(129)));
+        // 1e-128, the smallest value with a "regular" exponent byte.
+        assert_eq!(conv("8102"), format!("0.{}1", "0".repeat(127)));
+        // 1e125 and -1e125: exponent 62 (bytes 0xFF / 0x00).
+        assert_eq!(conv("FF0B"), format!("1{}", "0".repeat(125)));
+        assert_eq!(conv("005B66"), format!("-1{}", "0".repeat(125)));
+        // Largest magnitudes: 40 nines followed by 86 zeros (126 digits).
+        let max = format!("{}{}", "9".repeat(40), "0".repeat(86));
+        assert_eq!(conv(&repeat(0xFF, 0x64, 20)), max);
+        assert_eq!(
+            conv(&format!("{}66", repeat(0x00, 0x02, 20))),
+            format!("-{max}")
+        );
+        // Largest value below +infinity must not be confused with it.
+        assert_eq!(conv("FF64"), format!("99{}", "0".repeat(124)));
+        // Most negative value with one digit must not be confused with -infinity.
+        assert_eq!(conv("0002"), format!("-99{}", "0".repeat(124)));
+    }
+
+    #[test]
+    fn precision_limits() {
+        // 20 base-100 digits = 40 significant decimal digits.
+        let digits = "0D23394F5B".repeat(4);
+        assert_eq!(
+            conv(&format!("C1{digits}")),
+            "12.3456789012345678901234567890123456789"
+        );
+        assert_eq!(
+            conv(&format!("C0{digits}")),
+            "0.123456789012345678901234567890123456789"
+        );
+        // All digits 99, as integer and as fraction.
+        assert_eq!(conv(&repeat(0xD4, 0x64, 20)), "9".repeat(40));
+        assert_eq!(
+            conv(&repeat(0xC0, 0x64, 20)),
+            format!("0.{}", "9".repeat(40))
+        );
+        // Negative with 20 digits: 22 bytes with terminator, 21 without.
+        let neg = format!("-{}", "9".repeat(40));
+        assert_eq!(conv(&format!("{}66", repeat(0x2B, 0x02, 20))), neg);
+        assert_eq!(conv(&repeat(0x2B, 0x02, 20)), neg);
+        // 22 bytes is the maximum, 23 is rejected.
+        assert_eq!(
+            conv(&repeat(0xC1, 0x02, 21)),
+            format!("1.{}", "01".repeat(20))
+        );
+        assert_eq!(decode(&[0xC2; 23]), Err(Error::TooLong(23)));
+    }
+
+    #[test]
+    fn zero_digits() {
+        // Inner and trailing zero digits (byte 0x01 / 0x65).
+        assert_eq!(conv("C3020102"), "10001");
+        assert_eq!(conv("C30201"), "10000");
+        assert_eq!(conv("C3020101"), "10000");
+        assert_eq!(conv("3C64656466"), "-10001");
+        // Fractions with leading zeros.
+        assert_eq!(conv("C00B"), "0.1");
+        assert_eq!(conv("C002"), "0.01");
+        assert_eq!(conv("BF0B"), "0.001");
+        assert_eq!(conv("3F5B66"), "-0.1");
+        assert_eq!(conv("3F6466"), "-0.01");
+        // Integer and fraction separated by zero digits: 1.0001
+        assert_eq!(conv("C1020102"), "1.0001");
+    }
+
+    #[test]
+    fn digit_boundaries() {
+        // Positive digits are 1..=100, negative digits 2..=101.
+        assert_eq!(conv("C164"), "99");
+        assert_eq!(conv("C101"), "0");
+        assert_eq!(
+            decode(&[0xC1, 0x65]),
+            Err(Error::BadDigit { pos: 1, byte: 0x65 })
+        );
+        assert_eq!(conv("3E0266"), "-99");
+        assert_eq!(
+            decode(&[0x3E, 0x01]),
+            Err(Error::BadDigit { pos: 1, byte: 0x01 })
+        );
+        // 102 is only a terminator at the end, not in the middle.
+        assert_eq!(
+            decode(&[0x3E, 0x66, 0x02, 0x66]),
+            Err(Error::BadDigit { pos: 1, byte: 0x66 })
+        );
+        assert_eq!(
+            decode(&[0x3E, 0x67]),
+            Err(Error::BadDigit { pos: 1, byte: 0x67 })
+        );
+        // 0xFF followed by anything other than a single 0x65 is a regular number.
+        assert_eq!(
+            decode(&[0xFF, 0x65, 0x02]),
+            Err(Error::BadDigit { pos: 1, byte: 0x65 })
+        );
+    }
+
+    #[test]
+    fn input_limits() {
+        // Decimal bytes must fit in u8.
+        assert_eq!(conv("Typ=2 Len=2: 255,101"), "~");
+        assert_eq!(conv("Typ=2 Len=1: 0"), "-~");
+        assert_eq!(
+            parse_input("194,256", Format::Auto),
+            Err(Error::BadToken("256".into()))
+        );
+        assert_eq!(
+            parse_input("194,-1", Format::Auto),
+            Err(Error::BadToken("-1".into()))
+        );
+        assert_eq!(
+            parse_input("c1 1g", Format::Hex),
+            Err(Error::BadToken("1g".into()))
+        );
+        assert_eq!(
+            parse_input("0x", Format::Auto).and_then(|b| decode(&b)),
+            Err(Error::Empty)
+        );
+        // Non-ASCII input must not panic when slicing the hex string.
+        assert!(parse_input("c1ä2", Format::Auto).is_err());
+        // Maximum length in every input format.
+        let hex22 = format!("{}66", repeat(0x2B, 0x02, 20));
+        assert_eq!(conv(&hex22), format!("-{}", "9".repeat(40)));
+        let spaced: Vec<String> = (0..22)
+            .map(|i| hex22[2 * i..2 * i + 2].to_string())
+            .collect();
+        assert_eq!(
+            conv(&format!("col 0: [22] {}", spaced.join(" "))),
+            format!("-{}", "9".repeat(40))
+        );
+        let dec: Vec<String> = spaced
+            .iter()
+            .map(|t| u8::from_str_radix(t, 16).unwrap().to_string())
+            .collect();
+        assert_eq!(
+            conv(&format!("Typ=2 Len=22: {}", dec.join(","))),
+            format!("-{}", "9".repeat(40))
+        );
     }
 }

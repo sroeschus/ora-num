@@ -162,12 +162,17 @@ base-100 digits (most significant first), 22 bytes at most.
 | Value     | Exponent byte                | Digit byte          | Notes                           |
 |-----------|------------------------------|---------------------|---------------------------------|
 | zero      | `0x80`                       | —                   | single byte                     |
-| positive  | `> 0x80`, exponent = b − 193 | digit = b − 1       |                                 |
+| positive  | `≥ 0x80`, exponent = b − 193 | digit = b − 1       | `80 02` is 1e-130 (smallest)    |
 | negative  | `< 0x80`, exponent = 62 − b  | digit = 101 − b     | optionally terminated by `0x66` |
 | +infinity | `0xFF`                       | `0x65`              |                                 |
 | −infinity | `0x00`                       | —                   | single byte                     |
 
 The value is `sign × Σ digitᵢ × 100^(exponent − i)`.
+
+`0x80` and `0x00` only mean zero and −infinity when they are the only byte;
+followed by digits they are the smallest (−65) and largest (62) exponent. The
+representable range is therefore 1e-130 up to just below 1e126 in magnitude,
+with at most 40 significant decimal digits.
 
 ## Testing
 
