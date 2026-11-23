@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Stefan Roesch
+
 //! Convert an Oracle NUMBER from its internal (base-100) byte representation
 //! into an exact decimal string, or (with `--reverse`) a decimal number into
 //! its internal representation.
@@ -31,7 +33,7 @@ enum Format {
 /// Convert an Oracle internal NUMBER representation to a decimal number, or
 /// a decimal number to its internal representation with --reverse.
 #[derive(Parser, Debug)]
-#[command(version, about, long_about = None)]
+#[command(version, about, long_about = None, after_help = "Copyright (c) 2026 Stefan Roesch")]
 struct Args {
     /// Oracle internal number, e.g. "Typ=2 Len=3: 194,2,24", "194,2,24", "c2,2,18", "C20218"
     /// or "col 0: [ 3] c2 02 18". With --reverse a decimal number, e.g. "-1234.5678" or "1.5e-7"
